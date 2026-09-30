@@ -2,6 +2,7 @@ import time
 import requests
 import pandas as pd
 
+
 class NSEClient:
     BASE = "https://www.nseindia.com"
 
@@ -17,33 +18,24 @@ class NSEClient:
         self.warm()
 
     def warm(self):
-        # NSE needs cookies, without this 401/404 comes
-        try:
-            self.s.get(self.BASE + "/", timeout=15)
-            time.sleep(0.5)
-            self.s.get(self.BASE + "/option-chain", timeout=15)
-            time.sleep(0.5)
-        except:
-            pass
+        for path in ["/", "/option-chain"]:
+            try:
+                self.s.get(self.BASE + path, timeout=15)
+            except:
+                pass
 
-    def get(self, path, params=None, attempts=4):
+    def get(self, path, params=None, attempts=3):
         last = None
         for n in range(attempts):
             try:
                 r = self.s.get(self.BASE + path, params=params, timeout=25)
                 if r.status_code in (401, 403, 429):
-                    last = RuntimeError(f"NSE HTTP {r.status_code} - blocked")
+                    last = RuntimeError(f"NSE HTTP {r.status_code} - blocked/rate-limited")
                     self.warm()
                     time.sleep(2 + n*2)
                     continue
-                if r.status_code == 404:
-                    # For 404 we should not retry same, return None to try other endpoint
-                    raise requests.HTTPError(f"404 for {path} {params}", response=r)
                 r.raise_for_status()
                 return r.json()
-            except requests.HTTPError as he:
-                # 404 is final for this endpoint
-                raise he
             except Exception as e:
                 last = e
                 time.sleep(1+n)
@@ -52,72 +44,58 @@ class NSEClient:
     def get_banknifty_constituents(self):
         try:
             data = self.get("/api/equity-stockIndices", params={"index": "NIFTY BANK"})
-            res=[]
+            result = []
             for row in data.get("data", []):
-                sym=row.get("symbol")
+                sym = row.get("symbol")
                 if sym and sym.upper() not in ("NIFTY BANK","BANKNIFTY"):
-                    if sym not in res:
-                        res.append(sym)
-            if res:
-                return res
+                    if sym not in result:
+                        result.append(sym)
+            if result:
+                return result
         except:
             pass
-        return ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","AUBANK","PNB","BANKBARODA"]
+        return ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","AUBANK"]
 
     def get_option_chain(self, symbol, is_index=False, expiry=None):
-        """
-        New NSE v3 logic (working 2025-26):
-        1. /api/option-chain-contract-info?symbol=BANKNIFTY gives expiries
-        2. /api/option-chain-v3?type=Indices&symbol=BANKNIFTY&expiryDate=DD-MMM-YYYY
-        """
-        errors=[]
-        # Try 1: v3 without expiry (returns nearest)
+        # STEP 1: Try new v3 API - this is the current working API as of 2025-2026
+        # NSE flow: contract-info gives expiries, v3 gives chain for expiry
         try:
-            params = {"type": "Indices" if is_index else "Equities", "symbol": symbol}
             if expiry:
-                params["expiryDate"] = expiry
-            payload = self.get("/api/option-chain-v3", params=params)
-            if payload.get("records", {}).get("data"):
-                return payload
-        except Exception as e:
-            errors.append(f"v3 no-expiry failed: {e}")
-
-        # Try 2: get contract info then try each expiry
-        try:
-            contract = self.get("/api/option-chain-contract-info", params={"symbol": symbol})
-            # contract structure varies
-            expiries = contract.get("expiryDates") or contract.get("records", {}).get("expiryDates") or []
-            # if no expiry provided, try first expiry
-            target_expiries = [expiry] if expiry else expiries[:1]
-            for exp in target_expiries:
+                # Direct v3 call with expiry
+                params = {"type": "Indices" if is_index else "Equities", "symbol": symbol, "expiryDate": expiry}
+                payload = self.get("/api/option-chain-v3", params=params)
+                if payload.get("records", {}).get("data"):
+                    return payload
+            else:
+                # Get expiries first then chain - more reliable
                 try:
-                    params = {"type": "Indices" if is_index else "Equities", "symbol": symbol, "expiryDate": exp}
-                    payload = self.get("/api/option-chain-v3", params=params)
-                    if payload.get("records", {}).get("data"):
-                        return payload
-                except Exception as inner:
-                    errors.append(f"v3 with {exp} failed: {inner}")
-                    continue
+                    contract = self.get("/api/option-chain-contract-info", params={"symbol": symbol})
+                    # contract info contains expiry list, but we still need chain
+                except:
+                    pass
+                # try v3 without expiry - NSE returns nearest expiry
+                params = {"type": "Indices" if is_index else "Equities", "symbol": symbol}
+                payload = self.get("/api/option-chain-v3", params=params)
+                if payload.get("records", {}).get("data"):
+                    return payload
         except Exception as e:
-            errors.append(f"contract-info failed: {e}")
+            # v3 failed, will try old as fallback for error message
+            last_v3 = e
 
-        # Try 3: old endpoints (will 404 but we try)
+        # STEP 2: Old APIs - now return 404 (kept only to show clear error)
         try:
             if is_index:
                 return self.get("/api/option-chain-indices", params={"symbol": symbol})
             else:
                 return self.get("/api/option-chain-equities", params={"symbol": symbol})
-        except Exception as e:
-            errors.append(f"old api failed: {e}")
-
-        # If all fail, raise with full log
-        raise RuntimeError("NSE blocked all endpoints. Details: " + " | ".join(errors) + ". NSE session cookies expired - wait 2-3 min then click Load again. Do not spam refresh.")
+        except Exception as old_e:
+            raise RuntimeError(f"NSE API 404 fixed needed: Use v3 endpoint. Tried /api/option-chain-v3?type={'Indices' if is_index else 'Equities'}&symbol={symbol}. Old endpoint error: {old_e}")
 
     def get_derivative_quote(self, symbol):
         return self.get("/api/quote-derivative", params={"symbol": symbol})
 
     def parse_futures(self, payload):
-        rows=[]
+        rows = []
         def walk(x):
             if isinstance(x, dict):
                 if x.get("instrumentType") in ("FUTIDX","FUTSTK"):
@@ -130,8 +108,8 @@ class NSEClient:
         walk(payload)
         if not rows:
             return pd.DataFrame()
-        wanted=["symbol","expiryDate","lastPrice","change","pChange","openInterest","changeinOpenInterest","totalTradedVolume","underlyingValue","instrumentType"]
-        out=pd.DataFrame(rows)
+        wanted = ["symbol","expiryDate","lastPrice","change","pChange","openInterest","changeinOpenInterest","totalTradedVolume","underlyingValue","instrumentType"]
+        out = pd.DataFrame(rows)
         for c in wanted:
             if c not in out.columns:
                 out[c]=None
